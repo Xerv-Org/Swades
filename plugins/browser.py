@@ -1,5 +1,3 @@
-#needs pip install playwright and playwright install chromium
-
 import atexit
 import ipaddress
 import socket

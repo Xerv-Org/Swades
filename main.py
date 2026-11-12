@@ -34,7 +34,7 @@ try:
 except ImportError:
     fcntl = None
 
-inColab = True
+inColab = False
 
 HERE = Path(globals().get("__file__", "agent.py")).resolve().parent
 COLAB_HOME = Path("/content")
@@ -169,6 +169,31 @@ def clip(text, limit):
     head = limit * 2 // 3
     tail = limit - head
     return f"{text[:head]}\n[{len(text) - limit} chars cut]\n{text[-tail:]}"
+
+
+def bounded(fn, seconds, name):
+    if seconds <= 0:
+        return fn
+
+    def guarded(args):
+        box = {}
+
+        def target():
+            try:
+                box["value"] = fn(args)
+            except BaseException as exc:
+                box["error"] = exc
+
+        worker = threading.Thread(target=target, daemon=True)
+        worker.start()
+        worker.join(seconds)
+        if worker.is_alive():
+            raise ToolError(f"{name} timed out after {seconds:g}s")
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
+
+    return guarded
 
 
 def strip_html(text):
@@ -424,6 +449,7 @@ class Config:
     fetch_private: bool
     search_results: int
     grep_seconds: float
+    tool_timeout: float
     indent: int
     max_tools: int
     max_images: int
@@ -532,6 +558,7 @@ class Config:
             fetch_private=_flag("AGENT_FETCH_PRIVATE", "0"),
             search_results=_num("AGENT_SEARCH_RESULTS", 8, 1),
             grep_seconds=_num("AGENT_GREP_SECONDS", 20.0, 0.0),
+            tool_timeout=_num("AGENT_TOOL_TIMEOUT", 120.0, 0.0),
             indent=_num("AGENT_INDENT", 4, 1),
             max_tools=_num("AGENT_MAX_TOOLS", 15, 1),
             max_images=_num("AGENT_MAX_IMAGES", 3, 0),
@@ -823,7 +850,7 @@ class Checkpoints:
     def listing(self):
         self._ready()
         try:
-            return self._git("log", "-n", "20", "--format=%h %s") or "none"
+            return self._git("log", "--reflog", "-n", "20", "--format=%h %s") or "none"
         except AgentError:
             return "none"
 
@@ -1726,7 +1753,7 @@ class Api:
             raise AgentError(f"bad tool name {name}")
         if not callable(fn):
             raise AgentError(f"tool {name} is not callable")
-        item = Tool(name, desc, params, fn)
+        item = Tool(name, desc, params, bounded(fn, self.cfg.tool_timeout, name))
         item.schema()
         self.plugin.tools.append((item, bool(safe)))
 
@@ -2939,7 +2966,7 @@ def selftest():
         Local.reply = {"choices": [{"finish_reason": "stop", "message": {"content": "hi"}}], "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.002}}
         out = LLM(chat, meter).send([{"type": "text", "text": "sys"}], [], [{"role": "user", "content": "x"}])
         assert out["content"][0]["text"] == "hi" and out["stop_reason"] == "end_turn"
-                heads, body = Local.seen[-1]
+        heads, body = Local.seen[-1]
         assert heads["authorization"] == "Bearer k1" and heads["http-referer"] == "http://ref" and heads["x-title"] == "swades"
         assert body["usage"] == {"include": True} and body["model"] == "m1" and "tools" not in body
         assert meter.cost == 0.002 and meter.prompt == 10 and meter.completion == 5 and meter.calls == 1
@@ -3083,7 +3110,9 @@ def selftest():
         assert sandbox_out[sandbox_out.index("--bind") + 1] == str(cfg.root) and "--unshare-net" not in sandbox_out
         assert sandbox_out.count("--tmpfs") == 2 and str(cfg.plugin_dir) in sandbox_out
         assert "--unshare-net" in sandbox_args(replace(cfg, sandbox_net=False), "bwrap")
-        assert sandbox_args(replace(cfg, home=cfg.root / "st"), "bwrap").count("--tmpfs") == 1
+        inner = sandbox_args(replace(cfg, home=cfg.root / "st"), "bwrap")
+        last = len(inner) - 1 - inner[::-1].index("--tmpfs")
+        assert inner.count("--tmpfs") == 2 and last > inner.index("--bind") and inner[last + 1] == str(cfg.root / "st")
         assert sandbox_prefix(replace(cfg, sandbox="off")) == []
         if shutil.which("bwrap") is None:
             assert raises(lambda: sandbox_prefix(replace(cfg, sandbox="bwrap"))) and sandbox_prefix(replace(cfg, sandbox="auto")) == []
@@ -3142,6 +3171,7 @@ def selftest():
         (plugs / "Bad-Name.py").write_text("def setup(api):\n    pass\n")
 
         host = Host(cfg).load()
+        echo_log = sys.modules["agent_plugin_echo"].LOG
         assert {n: p.version for n, p in host.plugins.items()} == {"echo": "1.2", "multi": "2.0"}, host.plugins
         assert set(host.failed) == {"broken", "exiter", "hookbad", "nosetup", "plan", "shadow", "skilldup", "syntax", "zdup"}, host.failed
         assert "agent_plugin_syntax" not in sys.modules
@@ -3163,6 +3193,14 @@ def selftest():
         assert Host(replace(cfg, plugins=False)).load().plugins == {}
         assert raises(lambda: ReAct(cfg, ScriptedLLM([]), replace(built, extra=0), host), AgentError)
         assert Api(cfg, "x").data.is_dir()
+        quick = Api(replace(cfg, tool_timeout=0.3), "quick")
+        quick.tool("nap", "Sleep.", {}, lambda a: time.sleep(5))
+        quick.tool("fine", "Return.", {}, lambda a: "ok")
+        quick.tool("bad", "Fail.", {}, lambda a: 1 / 0)
+        began = time.monotonic()
+        assert raises(lambda: quick.plugin.tools[0][0].fn({})) and time.monotonic() - began < 3
+        assert quick.plugin.tools[1][0].fn({}) == "ok"
+        assert raises(lambda: quick.plugin.tools[2][0].fn({}), ZeroDivisionError)
         assert "PATH" in Api(cfg, "x").env() or "PATH" not in os.environ
         listing = plugin_list(host)
         assert "echo 1.2 tools=echo hooks=2 skills=1" in listing and "multi 2.0 tools=multi,snap" in listing
@@ -3184,7 +3222,7 @@ def selftest():
         (cfg.root / "hook.txt").write_text("x\n")
         res, err = probe._call({"name": "delete_file", "input": {"path": "hook.txt"}})
         assert err and res == "blocked by echo" and (cfg.root / "hook.txt").exists()
-        log = sys.modules["agent_plugin_echo"].LOG
+        log = echo_log
         assert "echo" in log and "skill" in log and "delete_file" not in log
 
         loud = host.build()
