@@ -1,0 +1,7 @@
+tools/
+tests/
+evidence.jsonl
+REPORT.md
+__pycache__/
+*.pyc
+swades_report.txt
