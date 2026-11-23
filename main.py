@@ -471,6 +471,7 @@ class Config:
     child_cycles: int
     parallel: int
     isolate_bytes: int
+    speculative: bool
 
     @classmethod
     def load(cls, llm=True, root=None, home=None, plugins=None, skills=None):
@@ -580,6 +581,7 @@ class Config:
             child_cycles=_num("AGENT_CHILD_CYCLES", 4, 1),
             parallel=_num("AGENT_PARALLEL", 3, 1),
             isolate_bytes=_num("AGENT_ISOLATE_BYTES", 200000000, 1),
+            speculative=_flag("AGENT_SPECULATIVE", "1"),
         )
 
 
@@ -621,6 +623,7 @@ class Kit:
     extra: int
     reads: frozenset
     hooks: dict
+    speculate: Callable = None
 
 
 @dataclass
@@ -1939,7 +1942,13 @@ class Host:
             prompts.append(PLAN_NOTE)
         hooks = {e: [fn for p in self.plugins.values() for ev, fn in p.hooks if ev == e] for e in EVENTS}
 
+        cache = {}
+        lock = threading.Lock()
+
         def state():
+            with lock:
+                if "val" in cache:
+                    return cache.pop("val")
             parts = [ws.state({})] if has_base else []
             for owner, fn in states:
                 try:
@@ -1948,8 +1957,25 @@ class Host:
                     parts.append(f"{owner} state failed: {exc}")
             return "\n".join(parts) or "none"
 
+        def speculate():
+            def run():
+                try:
+                    parts = [ws.state({})] if has_base else []
+                    for owner, fn in states:
+                        try:
+                            parts.append(str(fn()))
+                        except Exception as exc:
+                            parts.append(f"{owner} state failed: {exc}")
+                    with lock:
+                        cache["val"] = "\n".join(parts) or "none"
+                except Exception:
+                    pass
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            return t
+
         index = (lambda: ws.map_repo({})) if has_base else (lambda: "none")
-        return Kit("\n".join(prompts), tools, index, state, frozenset(safe), "\n".join(checks), added + (1 if has_skill else 0), frozenset(reads), hooks)
+        return Kit("\n".join(prompts), tools, index, state, frozenset(safe), "\n".join(checks), added + (1 if has_skill else 0), frozenset(reads), hooks, speculate)
 
 
 def _download(url, cfg, limit=2000000):
@@ -2288,7 +2314,12 @@ class ReAct:
         planned, used, nudges = False, 0, 0
         for _ in range(self.cfg.max_steps):
             self._trim(msgs)
-            reply = self.llm.send(self.system, self.schemas, msgs, self.tier)
+            worker = self.kit.speculate() if self.cfg.speculative and self.kit.speculate else None
+            try:
+                reply = self.llm.send(self.system, self.schemas, msgs, self.tier)
+            finally:
+                if worker:
+                    worker.join(0.5)
             content = self._clean(reply.get("content", []))
             if reply.get("stop_reason") == "max_tokens":
                 kept = [b for b in content if b["type"] == "text"] or [{"type": "text", "text": "(truncated)"}]
@@ -3233,6 +3264,16 @@ def selftest():
         quiet.hooks["after_tool"].append(lambda info: 1 / 0)
         res, err = ReAct(cfg, ScriptedLLM([]), quiet, host)._call({"name": "map_repo", "input": {}})
         assert not err and '"kind": "warn"' in (cfg.home / "audit.jsonl").read_text()
+
+        spec_kit = host.build()
+        assert callable(spec_kit.speculate)
+        thread = spec_kit.speculate()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        cached_res = spec_kit.state()
+        direct_res = spec_kit.state()
+        assert "files=" in cached_res and "files=" in direct_res
+        assert cfg.speculative is True and replace(cfg, speculative=False).speculative is False
 
         script = [
             use("p1", "echo", text="hi"),
