@@ -24,6 +24,11 @@ def setup(api):
         os.replace(tmp, path)
         return f"saved {len(text)} chars"
 
+    def read_tool(a):
+        return read() or "empty"
+
     api.tool("notes_write", "Replace the persistent notes with the full new text.", {"text": api.need()}, write)
+    api.tool("notes_read", "Read the current persistent notes.", {}, read_tool, safe=True)
     api.prompt(PROMPT)
+    api.check("Notes: verify notes using notes_read.")
     api.state(lambda: "NOTES\n" + (read().strip() or "empty; call notes_write to start memory"))
