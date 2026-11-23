@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -472,6 +473,8 @@ class Config:
     parallel: int
     isolate_bytes: int
     speculative: bool
+    cache_prompt: bool
+    wal: bool
 
     @classmethod
     def load(cls, llm=True, root=None, home=None, plugins=None, skills=None):
@@ -582,6 +585,8 @@ class Config:
             parallel=_num("AGENT_PARALLEL", 3, 1),
             isolate_bytes=_num("AGENT_ISOLATE_BYTES", 200000000, 1),
             speculative=_flag("AGENT_SPECULATIVE", "1"),
+            cache_prompt=_flag("AGENT_CACHE_PROMPT", "1"),
+            wal=_flag("AGENT_WAL", "1"),
         )
 
 
@@ -910,6 +915,27 @@ class Sessions:
             handle.write(row + "\n")
 
 
+class Wal:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.path), isolation_level=None)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS journal (id INTEGER PRIMARY KEY AUTOINCREMENT, cycle TEXT, step INT, kind TEXT, payload TEXT, ts REAL)")
+
+    def log(self, cycle, step, kind, payload):
+        text = json.dumps(payload, ensure_ascii=False)
+        self.conn.execute("INSERT INTO journal (cycle, step, kind, payload, ts) VALUES (?, ?, ?, ?, ?)", (str(cycle), step, kind, text, time.time()))
+
+    def steps(self):
+        cur = self.conn.execute("SELECT cycle, step, kind, payload FROM journal ORDER BY id ASC")
+        return [{"cycle": c, "step": s, "kind": k, "payload": json.loads(p)} for c, s, k, p in cur.fetchall()]
+
+    def close(self):
+        self.conn.close()
+
+
 class Isolation:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -989,16 +1015,23 @@ class LLM:
                 self.headers["X-Title"] = cfg.title
 
     @staticmethod
-    def _to_wire_tools(tools):
-        return [
-            {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
-            for t in tools
-        ]
+    def _to_wire_tools(tools, cache=False):
+        out = []
+        for i, t in enumerate(tools):
+            fn = {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}
+            entry = {"type": "function", "function": fn}
+            if cache and i == len(tools) - 1:
+                entry["cache_control"] = {"type": "ephemeral"}
+            out.append(entry)
+        return out
 
     @staticmethod
-    def _to_wire_messages(system, messages):
+    def _to_wire_messages(system, messages, cache=False):
         text = system if isinstance(system, str) else "\n".join(b["text"] for b in system if b.get("type") == "text")
-        out = [{"role": "system", "content": text}]
+        if cache:
+            out = [{"role": "system", "content": [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]}]
+        else:
+            out = [{"role": "system", "content": text}]
         for message in messages:
             content = message["content"]
             if isinstance(content, str):
@@ -1036,6 +1069,12 @@ class LLM:
                 out.append({"role": "user", "content": parts})
             if extra:
                 out.append({"role": "user", "content": "\n".join(extra)})
+        if cache and len(out) >= 3:
+            prev = out[-2]
+            if isinstance(prev.get("content"), str):
+                prev["content"] = [{"type": "text", "text": prev["content"], "cache_control": {"type": "ephemeral"}}]
+            elif isinstance(prev.get("content"), list) and prev["content"]:
+                prev["content"][-1]["cache_control"] = {"type": "ephemeral"}
         return out
 
     @staticmethod
@@ -1074,9 +1113,9 @@ class LLM:
             "child": (cfg.child_model, cfg.child_price_in, cfg.child_price_out),
         }.get(tier)
         model, pin, pout = route if route and route[0] else (cfg.model, cfg.price_in, cfg.price_out)
-        payload = {"model": model, "max_tokens": cfg.max_tokens, "messages": self._to_wire_messages(system, messages)}
+        payload = {"model": model, "max_tokens": cfg.max_tokens, "messages": self._to_wire_messages(system, messages, cfg.cache_prompt)}
         if tools:
-            payload["tools"] = self._to_wire_tools(tools)
+            payload["tools"] = self._to_wire_tools(tools, cfg.cache_prompt)
             payload["tool_choice"] = "auto"
         if cfg.provider == "openrouter":
             payload["usage"] = {"include": True}
@@ -2071,6 +2110,7 @@ class ReAct:
         self.tier = "child" if depth else "main"
         self.pad = "  " * depth
         self.ledger = Ledger(cfg)
+        self.wal = Wal(cfg.home / "session.db") if cfg.wal and not depth else None
         self.plan = {"delta": "", "steps": []}
         self.tools = {
             "plan": Tool(
@@ -2204,6 +2244,8 @@ class ReAct:
         args = json.dumps(call["input"], ensure_ascii=False)
         text = text_of(out)
         self.ledger.log("tool", cycle=str(cycle), depth=self.depth, tool=call["name"], args=clip(args, 600), err=err, out=clip(text, 400))
+        if self.wal:
+            self.wal.log(str(cycle), self.meter.tools, "tool", {"name": call["name"], "err": err, "out": clip(text, 400)})
         first = text.split("\n", 1)[0][:100]
         self._say(f"[{cycle}] {call['name']} {args[:90]} -> {'ERR ' if err else ''}{first}")
 
@@ -2382,6 +2424,9 @@ class ReAct:
 
     def _end(self, task, status, cycle, carry, last, repeats, text):
         self._save(task, status, cycle, carry, last, repeats)
+        if self.wal:
+            self.wal.log(str(cycle), self.meter.tools, "status", {"status": status, "text": clip(text, 500)})
+            self.wal.close()
         return text
 
     def run(self, task, state=None):
@@ -2390,6 +2435,8 @@ class ReAct:
         start = int(state.get("cycle", 0)) + 1
         final = start + self.cfg.max_cycles - 1
         judged = self.cfg.critic and self.cfg.mode != "plan" and bool(self.kit.safe)
+        if self.wal:
+            self.wal.log(str(start), 0, "start", {"task": clip(task, 500)})
         for cycle in range(start, final + 1):
             self.meter.note(cycles=1)
             self._say(f"\n=== cycle {cycle} ===")
@@ -2790,6 +2837,11 @@ def selftest():
         assert LLM._from_wire({"choices": [{"finish_reason": "length", "message": {"content": "cut"}}]})["stop_reason"] == "max_tokens"
         assert raises(lambda: LLM._from_wire({"choices": []}), AgentError)
         assert LLM._to_wire_tools([ws.tools()["grep"].schema()])[0]["function"]["parameters"]["type"] == "object"
+        cached_tools = LLM._to_wire_tools([ws.tools()["grep"].schema()], cache=True)
+        assert cached_tools[0].get("cache_control") == {"type": "ephemeral"}
+        cached_msgs = LLM._to_wire_messages("system rules", [{"role": "user", "content": "u1"}, {"role": "assistant", "content": [{"type": "text", "text": "a1"}]}, {"role": "user", "content": "u2"}], cache=True)
+        assert cached_msgs[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert cached_msgs[-2]["content"][0]["cache_control"] == {"type": "ephemeral"}
 
         shot = [{"type": "tool_result", "tool_use_id": "i1", "content": [{"type": "text", "text": "frame"}, {"type": "image", "media_type": "image/jpeg", "data": "QUJD"}], "is_error": False}]
         pic = LLM._to_wire_messages(system, [{"role": "assistant", "content": [{"type": "tool_use", "id": "i1", "name": "look", "input": {}}]}, {"role": "user", "content": shot}])
@@ -3056,6 +3108,15 @@ def selftest():
             assert (cpw / "a.txt").read_text() == "two\n"
             assert raises(lambda: cps.restore("deadbeef"), AgentError) and raises(lambda: cps.restore("zz!"), AgentError)
 
+        wal_path = Path(htmp) / "test.db"
+        w = Wal(wal_path)
+        w.log("1", 1, "test", {"k": "v"})
+        assert len(w.steps()) == 1 and w.steps()[0]["payload"] == {"k": "v"}
+        w.close()
+        w2 = Wal(wal_path)
+        assert len(w2.steps()) == 1 and w2.steps()[0]["kind"] == "test"
+        w2.close()
+
         ses = Sessions(cfg)
         assert ses.listing() == "none" and raises(lambda: ses.pick(), AgentError)
         saved_state = {"id": "abcd1234", "task": "t1", "status": "running", "cycle": 2, "carry": "c", "last": "d", "repeats": 1}
@@ -3274,6 +3335,7 @@ def selftest():
         direct_res = spec_kit.state()
         assert "files=" in cached_res and "files=" in direct_res
         assert cfg.speculative is True and replace(cfg, speculative=False).speculative is False
+        assert cfg.cache_prompt is True and cfg.wal is True
 
         script = [
             use("p1", "echo", text="hi"),
