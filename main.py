@@ -42,6 +42,7 @@ COLAB_HOME = Path("/content")
 PROVIDERS = {
     "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
     "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"),
 }
 MODES = ("auto", "ask", "plan")
 SANDBOXES = ("off", "auto", "bwrap")
@@ -1040,7 +1041,12 @@ class LLM:
             if message["role"] == "assistant":
                 said = "".join(b["text"] for b in content if b.get("type") == "text")
                 calls = [
-                    {"id": b["id"], "type": "function", "function": {"name": b["name"], "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False)}}
+                    {
+                        "id": b["id"],
+                        "type": "function",
+                        "function": {"name": b["name"], "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False)},
+                        **({"extra_content": b["extra_content"]} if b.get("extra_content") else {}),
+                    }
                     for b in content
                     if b.get("type") == "tool_use"
                 ]
@@ -1095,7 +1101,10 @@ class LLM:
                 args = {}
             if not isinstance(args, dict):
                 args = {}
-            blocks.append({"type": "tool_use", "id": call.get("id") or f"call_{uuid.uuid4().hex[:8]}", "name": fn.get("name", ""), "input": args})
+            item = {"type": "tool_use", "id": call.get("id") or f"call_{uuid.uuid4().hex[:8]}", "name": fn.get("name", ""), "input": args}
+            if call.get("extra_content"):
+                item["extra_content"] = call["extra_content"]
+            blocks.append(item)
         finish = choice.get("finish_reason")
         if finish == "length":
             stop = "max_tokens"
@@ -1113,9 +1122,10 @@ class LLM:
             "child": (cfg.child_model, cfg.child_price_in, cfg.child_price_out),
         }.get(tier)
         model, pin, pout = route if route and route[0] else (cfg.model, cfg.price_in, cfg.price_out)
-        payload = {"model": model, "max_tokens": cfg.max_tokens, "messages": self._to_wire_messages(system, messages, cfg.cache_prompt)}
+        cache = cfg.cache_prompt and cfg.provider == "openrouter"
+        payload = {"model": model, "max_tokens": cfg.max_tokens, "messages": self._to_wire_messages(system, messages, cache)}
         if tools:
-            payload["tools"] = self._to_wire_tools(tools, cfg.cache_prompt)
+            payload["tools"] = self._to_wire_tools(tools, cache)
             payload["tool_choice"] = "auto"
         if cfg.provider == "openrouter":
             payload["usage"] = {"include": True}
@@ -2289,7 +2299,10 @@ class ReAct:
             if b.get("type") == "text" and b.get("text"):
                 out.append({"type": "text", "text": b["text"]})
             elif b.get("type") == "tool_use":
-                out.append({"type": "tool_use", "id": b["id"], "name": b["name"], "input": b.get("input") or {}})
+                item = {"type": "tool_use", "id": b["id"], "name": b["name"], "input": b.get("input") or {}}
+                if b.get("extra_content"):
+                    item["extra_content"] = b["extra_content"]
+                out.append(item)
         return out
 
     def _brief(self, task, cycle, final, carry):

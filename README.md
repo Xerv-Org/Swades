@@ -9,6 +9,7 @@ Status: **beta, supervised use only.** See "Status and limits".
 ```bash
 export AGENT_PROVIDER=groq
 export GROQ_API_KEY=...              # or OPENROUTER_API_KEY with AGENT_PROVIDER=openrouter
+                                     # or GEMINI_API_KEY with AGENT_PROVIDER=gemini
 export AGENT_MODEL=<model name>
 export AGENT_PRICE_IN=<usd per million input tokens>
 export AGENT_PRICE_OUT=<usd per million output tokens>
@@ -130,7 +131,7 @@ Set `AGENT_REGISTRY` to a JSON file (`{"plugins": {"name": {"url": "...", "sha25
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AGENT_PROVIDER` | groq | `groq` or `openrouter`. `AGENT_BASE_URL` overrides the endpoint. |
+| `AGENT_PROVIDER` | groq | `groq`, `openrouter`, or `gemini`. `AGENT_BASE_URL` overrides the endpoint. |
 | `AGENT_MODEL` | required | Model name. |
 | `AGENT_BUDGET`, `AGENT_PRICE_IN/OUT` | 0 | Monthly USD cap and per-million-token prices. OpenRouter cost is read from the response if present. |
 | `AGENT_ROOT`, `AGENT_HOME` | cwd, `~/.react-agent` | Workspace and state folder. |
