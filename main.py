@@ -1139,7 +1139,7 @@ class LLM:
                     data = json.load(response)
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace")
-                transient = exc.code in RETRYABLE or (exc.code == 400 and "tool_use_failed" in detail)
+                transient = exc.code in RETRYABLE or (exc.code == 400 and ("tool_use_failed" in detail or "output_parse_failed" in detail))
                 if not transient or attempt == cfg.retries:
                     raise AgentError(f"api {exc.code}: {clip(detail, 800)}")
                 try:
