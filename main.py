@@ -1146,15 +1146,18 @@ class LLM:
                     wait = float(exc.headers.get("retry-after") or delay)
                 except ValueError:
                     wait = delay
+                reason = f"api {exc.code}"
             except (OSError, ValueError, http.client.HTTPException) as exc:
                 if attempt == cfg.retries:
                     raise AgentError(f"network: {exc}")
+                reason = "network error"
             else:
                 if not isinstance(data, dict):
                     raise AgentError("api returned a non-object body")
                 prompt_tokens, done, spend = self.ledger.charge(data.get("usage") or {}, pin, pout)
                 self.meter.add(tier, prompt_tokens, done, spend)
                 return self._from_wire(data)
+            say(f"{reason} (attempt {attempt + 1}/{cfg.retries}); waiting {int(wait)}s...")
             time.sleep(min(wait, 60) + random.uniform(0, 0.5))
             delay = min(delay * 2, 30)
         raise AgentError("retries exhausted")
